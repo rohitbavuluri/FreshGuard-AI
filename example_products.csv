@@ -1,0 +1,4 @@
+name,category,quantity,price,unit_cost,days_until_expiry
+Milk,Dairy,50,3,1.8,3
+Bread,Bakery,35,2.5,1.2,2
+Spinach,Produce,32,2.8,1.4,2
