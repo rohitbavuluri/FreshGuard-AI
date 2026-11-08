@@ -262,7 +262,8 @@ elif page=="Sales":
                     c.execute("INSERT INTO sales(product_id,quantity,sold_at,unit_price) VALUES(?,?,?,?)",
                               (pid,int(qty),date.today().isoformat(),unit_price))
                     st.success(f"Sale recorded: {qty} units for ${qty*unit_price:.2f}. Inventory updated.")
-                    st.rerun()
+
+            st.rerun()
     st.subheader("Recent transactions")
     st.dataframe(history().head(30)[["name","quantity","sold_at","unit_price"]],
                  use_container_width=True,hide_index=True)
