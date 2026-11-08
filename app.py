@@ -1,6 +1,7 @@
-import sqlite3
+import psycopg
+from psycopg.rows import dict_row
+from psycopg.errors import ForeignKeyViolation
 from datetime import date, timedelta, datetime
-from pathlib import Path
 import pandas as pd
 import streamlit as st
 
@@ -25,40 +26,40 @@ def recommend_discount(risk, unsold, stock):
 
 
 st.set_page_config(page_title="FreshGuard AI", page_icon="🥬", layout="wide")
-DB = Path(__file__).with_name("freshguard.db")
-
+# Set DATABASE_URL in Streamlit Community Cloud > App settings > Secrets.
+# Use the Supabase Session Pooler URI and keep the password private.
 def connect():
-    c = sqlite3.connect(DB)
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA foreign_keys=ON")
-    return c
+    return psycopg.connect(st.secrets["DATABASE_URL"], row_factory=dict_row)
+
 
 def init_db():
+    # The public.products and public.sales tables were already created in Supabase.
+    # Verify that they exist instead of silently creating a separate schema.
     with connect() as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS products(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL, category TEXT NOT NULL,
-            quantity INTEGER NOT NULL CHECK(quantity>=0),
-            price REAL NOT NULL CHECK(price>=0),
-            cost REAL NOT NULL CHECK(cost>=0),
-            expiry TEXT NOT NULL, discount INTEGER NOT NULL DEFAULT 0
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS sales(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id INTEGER NOT NULL,
-            quantity INTEGER NOT NULL CHECK(quantity>0),
-            sold_at TEXT NOT NULL,
-            unit_price REAL NOT NULL,
-            FOREIGN KEY(product_id) REFERENCES products(id)
-        )""")
+        c.execute("SELECT id FROM public.products LIMIT 0")
+        c.execute("SELECT id FROM public.sales LIMIT 0")
+
 
 def query(sql, params=()):
     with connect() as c:
-        return pd.read_sql_query(sql, c, params=params)
+        cur = c.execute(sql, params)
+        records = cur.fetchall()
+        df = pd.DataFrame(records, columns=[col.name for col in cur.description])
+    # PostgreSQL returns DATE and NUMERIC as date/Decimal; the UI and ML
+    # code expect ISO strings and regular numeric types.
+    for column in ("expiry", "sold_at"):
+        if column in df:
+            df[column] = df[column].map(lambda v: v.isoformat() if hasattr(v, "isoformat") else v)
+    for column in ("price", "cost", "discount", "unit_price"):
+        if column in df:
+            df[column] = pd.to_numeric(df[column])
+    return df
+
 
 def execute(sql, params=()):
     with connect() as c:
         c.execute(sql, params)
+
 
 def seed():
     if not query("SELECT id FROM products LIMIT 1").empty:
@@ -74,14 +75,14 @@ def seed():
     ]
     with connect() as c:
         for name,cat,qty,price,cost,days in items:
-            cur=c.execute("INSERT INTO products(name,category,quantity,price,cost,expiry) VALUES (?,?,?,?,?,?)",
+            cur=c.execute("INSERT INTO products(name,category,quantity,price,cost,expiry) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
                           (name,cat,qty,price,cost,(date.today()+timedelta(days=days)).isoformat()))
-            pid=cur.lastrowid
+            pid=cur.fetchone()["id"]
             # Simulated history for a classroom demonstration.
             base={"Milk":10,"Bread":12,"Yogurt":7,"Bananas":14,"Eggs":5,"Spinach":6,"Rice":2}[name]
             for days_ago in range(21,0,-1):
                 n=max(1,base+((days_ago*7+pid*3)%7)-3)
-                c.execute("INSERT INTO sales(product_id,quantity,sold_at,unit_price) VALUES (?,?,?,?)",
+                c.execute("INSERT INTO sales(product_id,quantity,sold_at,unit_price) VALUES (%s,%s,%s,%s)",
                           (pid,n,(date.today()-timedelta(days=days_ago)).isoformat(),price))
 
 def inventory():
@@ -154,7 +155,7 @@ st.sidebar.title("🥬 FreshGuard AI")
 st.sidebar.caption("Smart grocery and food waste management")
 page=st.sidebar.radio("Navigate",["Dashboard","Inventory","Sales","AI Predictions","Expiry Alerts","Reports"])
 st.sidebar.divider()
-st.sidebar.caption("Prototype • Local SQLite database")
+st.sidebar.caption("Prototype • Supabase PostgreSQL database")
 st.title(f"🥬 {page}")
 st.caption("Demo data is simulated. Forecasts use a Random Forest model when sufficient history is available, with a fallback for limited data.")
 
@@ -167,7 +168,7 @@ if page=="Dashboard":
     d.metric("Estimated at-risk cost",f"${f['at_risk_value'].sum():,.2f}")
     st.subheader("Products requiring attention")
     st.dataframe(f[["name","quantity","expiry","days_left","risk","unsold","at_risk_value"]],
-                 use_container_width=True,hide_index=True)
+                 width="stretch",hide_index=True)
     st.info("Try Inventory → Sales → AI Predictions → Expiry Alerts for the complete business workflow.")
 
 elif page=="Inventory":
@@ -186,11 +187,11 @@ elif page=="Inventory":
                 st.error("Enter a product name.")
             elif cost>price:
                 st.warning("Unit cost exceeds selling price. Product was saved; check pricing.")
-                execute("INSERT INTO products(name,category,quantity,price,cost,expiry) VALUES(?,?,?,?,?,?)",
+                execute("INSERT INTO products(name,category,quantity,price,cost,expiry) VALUES(%s,%s,%s,%s,%s,%s)",
                         (name.strip(),category,int(quantity),float(price),float(cost),expiry.isoformat()))
                 st.success("Product added."); st.rerun()
             else:
-                execute("INSERT INTO products(name,category,quantity,price,cost,expiry) VALUES(?,?,?,?,?,?)",
+                execute("INSERT INTO products(name,category,quantity,price,cost,expiry) VALUES(%s,%s,%s,%s,%s,%s)",
                         (name.strip(),category,int(quantity),float(price),float(cost),expiry.isoformat()))
                 st.success("Product added."); st.rerun()
     st.subheader("Current inventory")
@@ -231,14 +232,14 @@ elif page=="Inventory":
                 newexpiry=st.date_input("Expiry date",value=date.fromisoformat(row.expiry))
                 save=st.form_submit_button("Save changes")
                 if save:
-                    execute("UPDATE products SET quantity=?,price=?,expiry=? WHERE id=?",
+                    execute("UPDATE products SET quantity=%s,price=%s,expiry=%s WHERE id=%s",
                             (int(newqty),float(newprice),newexpiry.isoformat(),pid))
                     st.success("Updated."); st.rerun()
             if st.button("Remove product",help="Only products with no sales history can be removed"):
                 try:
-                    execute("DELETE FROM products WHERE id=?",(pid,))
+                    execute("DELETE FROM products WHERE id=%s",(pid,))
                     st.success("Removed."); st.rerun()
-                except sqlite3.IntegrityError:
+                except ForeignKeyViolation:
                     st.error("Cannot remove a product with sales history. Set stock to zero instead.")
 
 elif page=="Sales":
@@ -253,20 +254,22 @@ elif page=="Sales":
         qty=st.number_input("Units sold",min_value=1,step=1,value=1)
         if st.button("Complete sale",type="primary"):
             with connect() as c:
-                current=c.execute("SELECT quantity,price,discount FROM products WHERE id=?",(pid,)).fetchone()
+                current=c.execute("SELECT quantity,price,discount FROM products WHERE id=%s FOR UPDATE",(pid,)).fetchone()
                 if qty>current["quantity"]:
                     st.error("Not enough inventory to complete the sale.")
                 else:
                     unit_price=round(current["price"]*(1-current["discount"]/100),2)
-                    c.execute("UPDATE products SET quantity=quantity-? WHERE id=?",(int(qty),pid))
-                    c.execute("INSERT INTO sales(product_id,quantity,sold_at,unit_price) VALUES(?,?,?,?)",
+                    c.execute("UPDATE products SET quantity=quantity-%s WHERE id=%s",(int(qty),pid))
+                    c.execute("INSERT INTO sales(product_id,quantity,sold_at,unit_price) VALUES(%s,%s,%s,%s)",
                               (pid,int(qty),date.today().isoformat(),unit_price))
-                    st.success(f"Sale recorded: {qty} units for ${qty*unit_price:.2f}. Inventory updated.")
-
-            st.rerun()
+                    st.session_state["sale_message"] = f"Sale recorded: {qty} units for ${qty*unit_price:.2f}. Inventory updated."
+            if "sale_message" in st.session_state:
+                st.rerun()
+    if "sale_message" in st.session_state:
+        st.success(st.session_state.pop("sale_message"))
     st.subheader("Recent transactions")
     st.dataframe(history().head(30)[["name","quantity","sold_at","unit_price"]],
-                 use_container_width=True,hide_index=True)
+                 width="stretch",hide_index=True)
 
 elif page=="AI Predictions":
     st.subheader("Machine Learning Sales Predictions")
@@ -405,7 +408,7 @@ elif page=="Expiry Alerts":
                 type="primary"
             ):
                 execute(
-                    "UPDATE products SET discount=? WHERE id=?",
+                    "UPDATE products SET discount=%s WHERE id=%s",
                     (discount, int(pid))
                 )
 
